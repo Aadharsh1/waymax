@@ -51,3 +51,5 @@ from waymax.datatypes.simulator_state import SimulatorState
 from waymax.datatypes.simulator_state import update_state_by_log
 from waymax.datatypes.traffic_lights import TrafficLights
 from waymax.datatypes.traffic_lights import TrafficLightStates
+from waymax.datatypes.ship_trajectory import ShipTrajectory
+

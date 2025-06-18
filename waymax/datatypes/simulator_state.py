@@ -64,11 +64,11 @@ class SimulatorState:
   sim_trajectory: object_state.Trajectory
   # TODO(b/247841891) Support testset, i.e. no log_trajectory for all steps.
   log_trajectory: object_state.Trajectory
-  log_traffic_light: traffic_lights.TrafficLights
+  # log_traffic_light: traffic_lights.TrafficLights
   object_metadata: object_state.ObjectMetadata
   timestep: jax.typing.ArrayLike
-  sdc_paths: Optional[route.Paths] = None
-  roadgraph_points: Optional[roadgraph.RoadgraphPoints] = None
+  # sdc_paths: Optional[route.Paths] = None
+  # roadgraph_points: Optional[roadgraph.RoadgraphPoints] = None
 
   @property
   def shape(self) -> tuple[int, ...]:
@@ -120,12 +120,12 @@ class SimulatorState:
     data = [
         self.sim_trajectory,
         self.log_trajectory,
-        self.log_traffic_light,
+        # self.log_traffic_light,
         self.object_metadata,
         self.timestep,
     ]
-    if self.roadgraph_points is not None:
-      data.append(self.roadgraph_points)
+    # if self.roadgraph_points is not None:
+    #   data.append(self.roadgraph_points)
     chex.assert_equal_shape_prefix(data, len(self.shape))
 
 
