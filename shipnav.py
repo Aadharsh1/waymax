@@ -208,6 +208,95 @@ for _ in range(max_length - 1):
     states.append(next_state)
 
 
+metrics = {
+    'gc_ade': [],
+    'goal_rate': [],
+    'near_miss_rate': [],
+    'avg_drift': [],
+    'avg_curvature': [],
+}
+
+
+num_steps = len(states)
+near_miss_threshold = 555
+goal_threshold = 200
+
+for agent_idx in range(num_ships):
+    expert_x = traj.x[agent_idx]
+    expert_y = traj.y[agent_idx]
+    sim_x = jnp.array([state.sim_trajectory.x[agent_idx, state.timestep.item()] for state in states])
+    sim_y = jnp.array([state.sim_trajectory.y[agent_idx, state.timestep.item()] for state in states])
+    min_T = min(len(expert_x), len(sim_x))
+    gc_ade = jnp.mean(jnp.sqrt((expert_x[:min_T] - sim_x[:min_T])**2 + (expert_y[:min_T] - sim_y[:min_T])**2))
+    metrics['gc_ade'].append(float(gc_ade))
+
+    valid_mask = traj.valid[agent_idx]
+    last_valid_idx = int(jnp.where(valid_mask)[0][-1])
+
+    final_x = sim_x[last_valid_idx]
+    final_y = sim_y[last_valid_idx]
+
+    goal_x, goal_y = goal_positions[agent_idx]
+    dist_to_goal = jnp.sqrt((final_x - goal_x)**2 + (final_y - goal_y)**2)
+    goal_reached = dist_to_goal < goal_threshold
+    metrics['goal_rate'].append(bool(goal_reached))
+
+
+    # Near miss rate
+    near_miss_count = 0
+    for state in states:
+        x_all = state.sim_trajectory.x[:, state.timestep.item()]
+        y_all = state.sim_trajectory.y[:, state.timestep.item()]
+        x_i = x_all[agent_idx]
+        y_i = y_all[agent_idx]
+        for j in range(num_ships):
+            if j != agent_idx:
+                dist = jnp.sqrt((x_i - x_all[j])**2 + (y_i - y_all[j])**2)
+                if dist < near_miss_threshold:
+                    near_miss_count += 1
+                    break 
+    near_miss_rate = 100 * near_miss_count / num_steps
+    metrics['near_miss_rate'].append(float(near_miss_rate))
+
+    # Drift
+    drifts = []
+    for t in range(1, num_steps):
+        x0 = sim_x[t - 1]
+        y0 = sim_y[t - 1]
+        x1 = sim_x[t]
+        y1 = sim_y[t]
+        yaw = states[t].sim_trajectory.yaw[agent_idx, states[t].timestep.item()]
+        course = jnp.arctan2(y1 - y0, x1 - x0)
+        drift = (course - yaw + jnp.pi) % (2 * jnp.pi) - jnp.pi
+        drifts.append(jnp.abs(drift))
+    avg_drift = jnp.mean(jnp.array(drifts)) if drifts else 0.0
+    metrics['avg_drift'].append(float(jnp.degrees(avg_drift)))
+
+    # Curvature
+    curvatures = []
+    for t in range(1, num_steps - 1):
+        p1 = jnp.array([sim_x[t - 1], sim_y[t - 1]])
+        p2 = jnp.array([sim_x[t], sim_y[t]])
+        p3 = jnp.array([sim_x[t + 1], sim_y[t + 1]])
+        a = jnp.linalg.norm(p1 - p2)
+        b = jnp.linalg.norm(p2 - p3)
+        c = jnp.linalg.norm(p3 - p1)
+        if a * b * c == 0:
+            curvature = 0.0
+        else:
+            curvature = 4 * jnp.abs((p2[0]-p1[0])*(p3[1]-p1[1]) - (p2[1]-p1[1])*(p3[0]-p1[0])) / (a * b * c)
+        curvatures.append(curvature)
+    avg_curvature = jnp.mean(jnp.array(curvatures)) if curvatures else 0.0
+    metrics['avg_curvature'].append(float(avg_curvature))
+
+for i in range(num_ships):
+    print(f"Ship {i} | GC-ADE: {metrics['gc_ade'][i]:.2f} m | "
+          f"Goal Reached: {metrics['goal_rate'][i]} | "
+          f"Near Miss Rate: {metrics['near_miss_rate'][i]:.2f}% | "
+          f"Avg Drift: {metrics['avg_drift'][i]:.2f} deg | "
+          f"Avg Curvature: {metrics['avg_curvature'][i]:.4f}")
+
+
 def render_global_state(state, goal_positions, step_idx=None, wake_length=5):
     x = state.sim_trajectory.x
     y = state.sim_trajectory.y
@@ -302,15 +391,15 @@ def render_global_state(state, goal_positions, step_idx=None, wake_length=5):
     plt.close(fig)
     return img
 
-imgs = [
-    render_global_state(s, goal_positions=goal_positions, step_idx=i)
-    for i, s in enumerate(states)
-]
+# imgs = [
+#     render_global_state(s, goal_positions=goal_positions, step_idx=i)
+#     for i, s in enumerate(states)
+# ]
 
-mediapy.write_video("ship_simulation.mp4", imgs, fps=TARGET_FPS)
+# mediapy.write_video("ship_simulation.mp4", imgs, fps=TARGET_FPS)
 
-# ship_idx = 1
-# timestep = 5
+# ship_idx = 0
+# timestep = 0
 
 # print("Ego history at timestep", timestep)
 # print(sim_state.sim_trajectory.ego_histories[ship_idx, timestep])

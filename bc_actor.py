@@ -30,12 +30,10 @@ class BCActor:
     def select_action(self, rng_key, state, agent_idx, _):
         timestep = int(state.timestep)
 
-        # Get current pose
         x_current = state.sim_trajectory.x[agent_idx, timestep]
         y_current = state.sim_trajectory.y[agent_idx, timestep]
         yaw_current = state.sim_trajectory.yaw[agent_idx, timestep]
 
-        # Build observation
         ego = state.sim_trajectory.ego_histories[agent_idx][timestep]
         neighbors = state.sim_trajectory.neighbor_histories[agent_idx][timestep]
         goal = state.sim_trajectory.goals[agent_idx]
@@ -63,10 +61,10 @@ class BCActor:
         vel_x = dx / dt
         vel_y = dy / dt
 
-        # Debug
-        print(f"[DEBUG] timestep {timestep} | dx: {dx}, dy: {dy}, dyaw: {dyaw}")
-        print(f"[DEBUG] x_new: {x_new}, y_new: {y_new}, yaw_new: {yaw_new}")
-        print(f"[DEBUG] vel_x: {vel_x}, vel_y: {vel_y}")
+        # # Debug
+        # print(f"[DEBUG] timestep {timestep} | dx: {dx}, dy: {dy}, dyaw: {dyaw}")
+        # print(f"[DEBUG] x_new: {x_new}, y_new: {y_new}, yaw_new: {yaw_new}")
+        # print(f"[DEBUG] vel_x: {vel_x}, vel_y: {vel_y}")
 
         num_objects = state.sim_trajectory.x.shape[0]
 
