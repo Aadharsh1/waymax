@@ -1,5 +1,10 @@
+# Ignore virtual env, builds, large binaries
 max/
 *.dll
 *.exe
 *.pyd
 *.lib
+*.so
+*.whl
+venv/
+.env/
