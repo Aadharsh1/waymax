@@ -244,17 +244,39 @@ for agent_idx in range(num_ships):
 
     # Near miss rate
     near_miss_count = 0
+    N_NEIGHBORS = traj.neighbor_histories.shape[2]  
+    # print(N_NEIGHBORS)
     for state in states:
-        x_all = state.sim_trajectory.x[:, state.timestep.item()]
-        y_all = state.sim_trajectory.y[:, state.timestep.item()]
-        x_i = x_all[agent_idx]
-        y_i = y_all[agent_idx]
-        for j in range(num_ships):
-            if j != agent_idx:
-                dist = jnp.sqrt((x_i - x_all[j])**2 + (y_i - y_all[j])**2)
+        timestep_idx = state.timestep.item()
+        x_i = state.sim_trajectory.x[agent_idx, timestep_idx]
+        y_i = state.sim_trajectory.y[agent_idx, timestep_idx]
+        neighbors = state.sim_trajectory.neighbor_histories[agent_idx, timestep_idx]
+        near_miss_found = False
+        for neighbor in neighbors:
+            neighbor_x = neighbor[-1, 0]
+            neighbor_y = neighbor[-1, 1]
+            if neighbor_x == 0.0 and neighbor_y == 0.0:
+                continue  
+            dist = jnp.sqrt((x_i - neighbor_x)**2 + (y_i - neighbor_y)**2)
+            if dist < near_miss_threshold:
+                near_miss_count += 1
+                near_miss_found = True
+                break  
+
+        if not near_miss_found:
+            x_all = state.sim_trajectory.x[:, timestep_idx]
+            y_all = state.sim_trajectory.y[:, timestep_idx]
+
+            for j in range(num_ships):
+                if j == agent_idx:
+                    continue
+                other_x = x_all[j]
+                other_y = y_all[j]
+                dist = jnp.sqrt((x_i - other_x)**2 + (y_i - other_y)**2)
                 if dist < near_miss_threshold:
                     near_miss_count += 1
-                    break 
+                    break  
+
     near_miss_rate = 100 * near_miss_count / num_steps
     metrics['near_miss_rate'].append(float(near_miss_rate))
 
