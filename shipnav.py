@@ -1,4 +1,4 @@
-DATA_FOLDER = "obs_data"
+import pickle
 TARGET_FPS = 10
 import pandas as pd
 import os
@@ -10,9 +10,10 @@ from waymax.datatypes import (
     SimulatorState,
     ShipTrajectory as Trajectory,
     ObjectMetadata,
+    Action,
 )
 from waymax import dynamics, agents
-from waymax.env import MultiAgentEnvironment
+from waymax.env import MultiAgentEnvironment,WaymaxGymEnv
 from waymax.config import EnvironmentConfig, ObjectType
 import dataclasses
 import jax
@@ -20,39 +21,34 @@ import mediapy
 import matplotlib.pyplot as plt
 from bc_actor import BCActor
 import torch
+from waymax.agents.actor_core import WaymaxActorOutput
+import numpy as np
+import jax.numpy as jnp
 
-def unpack_observation_vector(obs_vector):
-    ego = obs_vector[:44].reshape(11, 4)
-    neighbors = obs_vector[44:484].reshape(10, 11, 4)
-    goal = obs_vector[484:486]
-    return ego, neighbors, goal
+with open('observations.pkl', 'rb') as f:
+    observations = pickle.load(f)
 
-episode_files = sorted([f for f in os.listdir(DATA_FOLDER) if f.endswith(".csv")])
-# print(f"Found {len(episode_files)} episodes:")
-# for f in episode_files:
-#     print(f"  - {f}")
-
-num_ships = len(episode_files)
-dfs = [pd.read_csv(os.path.join(DATA_FOLDER, f)) for f in episode_files]
-max_length = max(len(df) for df in dfs)
-obj_idx = jnp.arange(num_ships)
-# print(f"Maximum episode length: {max_length} steps")
-
-x, y, speed, heading, valid = [], [], [], [], []
-goal_positions = []
+observations = observations[37:38]
+num_ships = len(observations)
+max_length = max(len(ship_obs) for ship_obs in observations)
+print(max_length)
 ego_histories_all = []
 neighbor_histories_all = []
+goal_positions = []
+x, y, speed, heading, valid = [], [], [], [], []
 
-for df in dfs:
+for ship_idx in range(num_ships):
+    ship_obs = observations[ship_idx]
     episode_x, episode_y, episode_speed, episode_heading, episode_valid = [], [], [], [], []
     ego_histories_this_episode = []
     neighbor_histories_this_episode = []
     episode_goal = None
 
-    for i in range(len(df)):
-        row = df.iloc[i]
-        obs_vector = row.to_numpy(dtype=np.float32)
-        ego, neighbors, goal = unpack_observation_vector(obs_vector)
+    for t in range(len(ship_obs)):
+        obs = ship_obs[t]
+        ego = obs['ego']
+        neighbors = obs['neighbors']
+        goal = obs['goal']
 
         if episode_goal is None:
             episode_goal = goal
@@ -67,8 +63,8 @@ for df in dfs:
         ego_histories_this_episode.append(ego)
         neighbor_histories_this_episode.append(neighbors)
 
-    # Padding
-    pad_len = max_length - len(df)
+    # Padding for episodes shorter than max_length
+    pad_len = max_length - len(ship_obs)
     episode_x += [0.0] * pad_len
     episode_y += [0.0] * pad_len
     episode_speed += [0.0] * pad_len
@@ -88,7 +84,6 @@ for df in dfs:
     goal_positions.append(episode_goal)
 
 goal_positions = np.array(goal_positions)
-
 x = jnp.array(x)
 y = jnp.array(y)
 speed = jnp.array(speed)
@@ -101,10 +96,10 @@ neighbor_histories_all = jnp.array(neighbor_histories_all)
 goal_positions = jnp.array(goal_positions)
 
 timestamps = []
-for df in dfs:
-    timestamps_episode = np.arange(len(df)) * 10
+for length in [len(ship_obs) for ship_obs in observations]:
+    timestamps_episode = np.arange(length) * 10
     timestamps_episode_micro = (timestamps_episode * 1e6).astype(np.int64)
-    pad_len = max_length - len(df)
+    pad_len = max_length - length
     timestamps_episode_micro = np.pad(timestamps_episode_micro, (0, pad_len), 'constant')
     timestamps.append(timestamps_episode_micro)
 timestamps = jnp.array(timestamps)
@@ -123,17 +118,15 @@ traj = Trajectory(
     goals=goal_positions
 )
 
-
 meta = ObjectMetadata(
     ids=jnp.arange(num_ships),
     object_types=jnp.zeros(num_ships, dtype=jnp.int32),
     is_sdc=jnp.array([True] + [False]*(num_ships-1)),
     is_modeled=jnp.ones(num_ships, dtype=bool),
     is_valid=jnp.ones(num_ships, dtype=bool),
-    is_controlled = jnp.ones(num_ships, dtype=bool),
+    is_controlled=jnp.ones(num_ships, dtype=bool),
     objects_of_interest=jnp.zeros(num_ships, dtype=bool)
 )
-
 
 sim_state = SimulatorState(
     sim_trajectory=traj,
@@ -151,6 +144,7 @@ env = MultiAgentEnvironment(
         controlled_object=ObjectType.VALID
     )
 )
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model_path = "model_weights/bc_weights.pth"
@@ -178,8 +172,8 @@ actor_expert = agents.create_expert_actor(
 # )
 
 actor_list = [
-    (actor_expert, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids > 0)),
-    (bc_actor, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids == 0))
+    (actor_expert, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids >= 0)),
+    # (bc_actor, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids > 0))
 ]
 
 jit_step = jax.jit(env.step)
@@ -192,21 +186,64 @@ for actor, _ in actor_list:
     else:
         jit_select_action_list.append(jax.jit(actor.select_action))
 
+num_agents = num_ships 
+print(num_agents)
+
+def no_op_action_for_agent(agent_idx, num_objects):
+    action_data = jnp.zeros((num_objects, 5), dtype=jnp.float32)
+    valid = jnp.zeros((num_objects, 1), dtype=bool)
+    is_ctrl = jnp.zeros((num_objects,), dtype=bool)
+    return WaymaxActorOutput(
+        actor_state=None,
+        action=Action(data=action_data, valid=valid),
+        is_controlled=is_ctrl
+    )
+
 
 states = [sim_state]
+done_mask = jnp.zeros(num_agents, dtype=bool)  # Track which agents are done
+done_mask_history = []
+
 for _ in range(max_length - 1):
     current_state = states[-1]
-    outputs = []
+    outputs = [None] * num_agents
 
-    for (jit_select_action, (actor, is_controlled_func)) in zip(jit_select_action_list, actor_list):
-        controlled = jnp.where(is_controlled_func(current_state))[0]
-        for agent_idx in controlled:
-            outputs.append(jit_select_action({}, current_state, int(agent_idx), None))
+    # For each agent, select action if not done, else no-op
+    for agent_idx in range(num_agents):
+        # Find which actor controls this agent
+        for (actor, is_controlled_func), jit_select_action in zip(actor_list, jit_select_action_list):
+            if is_controlled_func(current_state)[agent_idx]:
+                if not done_mask[agent_idx]:
+                    outputs[agent_idx] = jit_select_action({}, current_state, int(agent_idx), None)
+                else:
+                    outputs[agent_idx] = no_op_action_for_agent(agent_idx, num_agents)
+                break  # Only one actor per agent
 
     action = agents.merge_actions(outputs)
     next_state = jit_step(current_state, action)
     states.append(next_state)
+    # Update done_mask for each agent
+    terminated = env.termination(next_state)
+    truncated = env.truncation(next_state)
+    done_mask = jnp.logical_or(done_mask, jnp.logical_or(terminated, truncated))
+    done_mask_history.append(done_mask)
 
+    if jnp.all(done_mask):
+        break
+
+# After simulation, convert done_mask_history to array
+if len(done_mask_history) == 0:
+    done_mask_history = jnp.zeros((1, num_agents), dtype=bool)
+else:
+    done_mask_history = jnp.stack(done_mask_history, axis=0)
+# Find the first done step for each agent
+first_done_step = []
+for agent_idx in range(num_agents):
+    done_steps = jnp.where(done_mask_history[:, agent_idx])[0]
+    if len(done_steps) > 0:
+        first_done_step.append(int(done_steps[0]))
+    else:
+        first_done_step.append(len(states) - 1)  # never done, use last step
 
 metrics = {
     'gc_ade': [],
@@ -216,41 +253,55 @@ metrics = {
     'avg_curvature': [],
 }
 
-
 num_steps = len(states)
 near_miss_threshold = 555
 goal_threshold = 200
 
 for agent_idx in range(num_ships):
+    # Check if this agent is valid
+    valid_mask = traj.valid[agent_idx]
+    if not jnp.any(valid_mask):
+        # Skip padded agents
+        metrics['gc_ade'].append(0.0)
+        metrics['goal_rate'].append(False)
+        metrics['near_miss_rate'].append(0.0)
+        metrics['avg_drift'].append(0.0)
+        metrics['avg_curvature'].append(0.0)
+        continue
+    
+    # Find the last valid timestep for this agent
+    last_valid_idx = int(jnp.where(valid_mask)[0][-1])
+    
     expert_x = traj.x[agent_idx]
     expert_y = traj.y[agent_idx]
-    sim_x = jnp.array([state.sim_trajectory.x[agent_idx, state.timestep.item()] for state in states])
-    sim_y = jnp.array([state.sim_trajectory.y[agent_idx, state.timestep.item()] for state in states])
+    T = min(first_done_step[agent_idx] + 1, last_valid_idx + 1)
+    
+    sim_x = jnp.array([state.sim_trajectory.x[agent_idx, int(state.timestep)] for state in states[:T]])
+    sim_y = jnp.array([state.sim_trajectory.y[agent_idx, int(state.timestep)] for state in states[:T]])
     min_T = min(len(expert_x), len(sim_x))
     gc_ade = jnp.mean(jnp.sqrt((expert_x[:min_T] - sim_x[:min_T])**2 + (expert_y[:min_T] - sim_y[:min_T])**2))
     metrics['gc_ade'].append(float(gc_ade))
 
-    valid_mask = traj.valid[agent_idx]
-    last_valid_idx = int(jnp.where(valid_mask)[0][-1])
-
-    final_x = sim_x[last_valid_idx]
-    final_y = sim_y[last_valid_idx]
+    # Use the last valid position from simulated trajectory, not original trajectory
+    final_x = sim_x[-1]  # Use simulated trajectory
+    final_y = sim_y[-1]  # Use simulated trajectory
 
     goal_x, goal_y = goal_positions[agent_idx]
     dist_to_goal = jnp.sqrt((final_x - goal_x)**2 + (final_y - goal_y)**2)
+    print(f"Ship {agent_idx}: Final valid position = ({float(final_x):.2f}, {float(final_y):.2f}), "
+          f"Goal position = ({float(goal_x):.2f}, {float(goal_y):.2f})")
+    print(f"Distance to goal = {float(dist_to_goal):.2f} m")
     goal_reached = dist_to_goal < goal_threshold
     metrics['goal_rate'].append(bool(goal_reached))
-
 
     # Near miss rate
     near_miss_count = 0
     N_NEIGHBORS = traj.neighbor_histories.shape[2]  
-    # print(N_NEIGHBORS)
-    for state in states:
-        timestep_idx = state.timestep.item()
-        x_i = state.sim_trajectory.x[agent_idx, timestep_idx]
-        y_i = state.sim_trajectory.y[agent_idx, timestep_idx]
-        neighbors = state.sim_trajectory.neighbor_histories[agent_idx, timestep_idx]
+    for t in range(T):
+        timestep_idx = int(states[t].timestep)
+        x_i = states[t].sim_trajectory.x[agent_idx, timestep_idx]
+        y_i = states[t].sim_trajectory.y[agent_idx, timestep_idx]
+        neighbors = states[t].sim_trajectory.neighbor_histories[agent_idx, timestep_idx]
         near_miss_found = False
         for neighbor in neighbors:
             neighbor_x = neighbor[-1, 0]
@@ -262,11 +313,9 @@ for agent_idx in range(num_ships):
                 near_miss_count += 1
                 near_miss_found = True
                 break  
-
         if not near_miss_found:
-            x_all = state.sim_trajectory.x[:, timestep_idx]
-            y_all = state.sim_trajectory.y[:, timestep_idx]
-
+            x_all = states[t].sim_trajectory.x[:, timestep_idx]
+            y_all = states[t].sim_trajectory.y[:, timestep_idx]
             for j in range(num_ships):
                 if j == agent_idx:
                     continue
@@ -276,18 +325,17 @@ for agent_idx in range(num_ships):
                 if dist < near_miss_threshold:
                     near_miss_count += 1
                     break  
-
-    near_miss_rate = 100 * near_miss_count / num_steps
+    near_miss_rate = 100 * near_miss_count / T
     metrics['near_miss_rate'].append(float(near_miss_rate))
 
     # Drift
     drifts = []
-    for t in range(1, num_steps):
+    for t in range(1, T):
         x0 = sim_x[t - 1]
         y0 = sim_y[t - 1]
         x1 = sim_x[t]
         y1 = sim_y[t]
-        yaw = states[t].sim_trajectory.yaw[agent_idx, states[t].timestep.item()]
+        yaw = states[t].sim_trajectory.yaw[agent_idx, int(states[t].timestep)]
         course = jnp.arctan2(y1 - y0, x1 - x0)
         drift = (course - yaw + jnp.pi) % (2 * jnp.pi) - jnp.pi
         drifts.append(jnp.abs(drift))
@@ -296,7 +344,7 @@ for agent_idx in range(num_ships):
 
     # Curvature
     curvatures = []
-    for t in range(1, num_steps - 1):
+    for t in range(1, T - 1):
         p1 = jnp.array([sim_x[t - 1], sim_y[t - 1]])
         p2 = jnp.array([sim_x[t], sim_y[t]])
         p3 = jnp.array([sim_x[t + 1], sim_y[t + 1]])
@@ -314,9 +362,22 @@ for agent_idx in range(num_ships):
 for i in range(num_ships):
     print(f"Ship {i} | GC-ADE: {metrics['gc_ade'][i]:.2f} m | "
           f"Goal Reached: {metrics['goal_rate'][i]} | "
-          f"Near Miss Rate: {metrics['near_miss_rate'][i]:.2f}% | "
-          f"Avg Drift: {metrics['avg_drift'][i]:.2f} deg | "
-          f"Avg Curvature: {metrics['avg_curvature'][i]:.4f}")
+          f"Near Miss Rate: {metrics['near_miss_rate'][i]}% | "
+          f"Avg Drift: {metrics['avg_drift'][i]} deg | "
+          f"Avg Curvature: {metrics['avg_curvature'][i]}")
+
+# agent_idx = 0
+# print("Testing observe_agent for agent", agent_idx)
+# for t in range(3):
+#     state = states[t]
+#     obs = env.observe_agent(state, agent_idx)
+#     print(f"\nTimestep {t}:")
+#     print("ego shape:", obs['ego'].shape)
+#     print("ego:", obs['ego'])
+#     print("neighbors shape:", obs['neighbors'].shape)
+#     print("neighbors:", obs['neighbors'])
+#     print("goal shape:", obs['goal'].shape)
+#     print("goal:", obs['goal'])
 
 
 def render_global_state(state, goal_positions, step_idx=None, wake_length=5):

@@ -33,13 +33,12 @@ class BCActor:
         x_current = state.sim_trajectory.x[agent_idx, timestep]
         y_current = state.sim_trajectory.y[agent_idx, timestep]
         yaw_current = state.sim_trajectory.yaw[agent_idx, timestep]
-
         ego = state.sim_trajectory.ego_histories[agent_idx][timestep]
         neighbors = state.sim_trajectory.neighbor_histories[agent_idx][timestep]
         goal = state.sim_trajectory.goals[agent_idx]
 
-        ego_flat = ego.flatten()
-        neighbors_flat = neighbors.flatten()
+        ego_flat = ego.flatten() #11x4
+        neighbors_flat = neighbors.flatten() #10x11x4
         goal_flat = goal.flatten()
 
         obs = jnp.concatenate([ego_flat, neighbors_flat, goal_flat])
@@ -61,10 +60,10 @@ class BCActor:
         vel_x = dx / dt
         vel_y = dy / dt
 
-        # # Debug
-        # print(f"[DEBUG] timestep {timestep} | dx: {dx}, dy: {dy}, dyaw: {dyaw}")
-        # print(f"[DEBUG] x_new: {x_new}, y_new: {y_new}, yaw_new: {yaw_new}")
-        # print(f"[DEBUG] vel_x: {vel_x}, vel_y: {vel_y}")
+        # if agent_idx == 1:
+        #     print(f"[DEBUG] timestep {timestep} | dx: {dx}, dy: {dy}, dyaw: {dyaw}")
+        #     print(f"[DEBUG] x_new: {x_new}, y_new: {y_new}, yaw_new: {yaw_new}")
+        #     print(f"[DEBUG] vel_x: {vel_x}, vel_y: {vel_y}")
 
         num_objects = state.sim_trajectory.x.shape[0]
 

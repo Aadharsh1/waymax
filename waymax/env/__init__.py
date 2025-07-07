@@ -31,3 +31,4 @@ from waymax.env.typedefs import PyTree
 from waymax.env.typedefs import RewardFn
 from waymax.env.wrappers.brax_wrapper import BraxWrapper
 from waymax.env.wrappers.dm_env_wrapper import DMEnvWrapper
+from waymax.env.waymax_gym_env import WaymaxGymEnv

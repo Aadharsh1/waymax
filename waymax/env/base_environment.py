@@ -28,6 +28,9 @@ from waymax import metrics
 from waymax import rewards
 from waymax.env import abstract_environment
 from waymax.env import typedefs as types
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
 
 
 class BaseEnvironment(abstract_environment.AbstractEnvironment):
@@ -60,6 +63,30 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
     return metrics.run_metrics(
         simulator_state=state, metrics_config=self.config.metrics
     )
+  
+  def termination(self, state):
+    t = int(state.timestep)
+    x = state.sim_trajectory.x[:, t]
+    y = state.sim_trajectory.y[:, t]
+    goals = state.sim_trajectory.goals  
+    goal_x = goals[:, 0]
+    goal_y = goals[:, 1]
+    dist = jnp.sqrt((x - goal_x) ** 2 + (y - goal_y) ** 2)
+    goal_threshold = 200.0
+    terminated = dist < goal_threshold
+    if jnp.any(terminated):
+        print(f"terminated at timestep {t} for agents: {jnp.where(terminated)[0]}")
+    return terminated
+ 
+
+  def truncation(self, state):
+    t = int(state.timestep)
+    max_length = 1000  
+    truncated = t >= (max_length - 1)
+    if truncated:
+        print(f"Truncation reached at timestep {t}")
+    return jnp.array([truncated] * state.sim_trajectory.x.shape[0])
+
 
   def reset(
       self, state: datatypes.SimulatorState, rng: jax.Array | None = None
@@ -195,6 +222,35 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
 
   def observation_spec(self) -> types.Observation:
     raise NotImplementedError()
+
+  def observe_agent(self, state, agent_idx, n_neighbors=10):
+      """Returns a gym-compatible observation for a given agent at the current timestep."""
+      timestep = int(state.timestep)
+      # Ego history: (11, 4)
+      ego = np.array(state.sim_trajectory.ego_histories[agent_idx, timestep])
+      # Neighbors: (N, 11, 4)
+      neighbors = np.array(state.sim_trajectory.neighbor_histories[agent_idx, timestep])
+      # Pad or truncate neighbors to n_neighbors
+      if neighbors.shape[0] < n_neighbors:
+          pad = np.zeros((n_neighbors - neighbors.shape[0], 11, 4), dtype=neighbors.dtype)
+          neighbors = np.concatenate([neighbors, pad], axis=0)
+      elif neighbors.shape[0] > n_neighbors:
+          neighbors = neighbors[:n_neighbors]
+      # Goal: (2,)
+      goal = np.array(state.sim_trajectory.goals[agent_idx])
+      return {
+          'ego': ego,
+          'neighbors': neighbors,
+          'goal': goal,
+      }
+
+  @property
+  def observation_space(self):
+      return spaces.Dict({
+          'ego': spaces.Box(low=-np.inf, high=np.inf, shape=(11, 4), dtype=np.float32),
+          'neighbors': spaces.Box(low=-np.inf, high=np.inf, shape=(10, 11, 4), dtype=np.float32),
+          'goal': spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
+      })
 
 
 def _get_control_mask(
