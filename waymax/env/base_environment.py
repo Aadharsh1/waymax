@@ -31,6 +31,7 @@ from waymax.env import typedefs as types
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+from maritime_rl.utils import haversine_distance
 
 
 class BaseEnvironment(abstract_environment.AbstractEnvironment):
@@ -66,26 +67,54 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
   
   def termination(self, state):
     t = int(state.timestep)
+    valid_agents = state.sim_trajectory.valid[:, t]
+    
     x = state.sim_trajectory.x[:, t]
     y = state.sim_trajectory.y[:, t]
     goals = state.sim_trajectory.goals  
     goal_x = goals[:, 0]
     goal_y = goals[:, 1]
+    
     dist = jnp.sqrt((x - goal_x) ** 2 + (y - goal_y) ** 2)
     goal_threshold = 200.0
-    terminated = dist < goal_threshold
+    terminated = (dist < goal_threshold) & valid_agents
+    
     if jnp.any(terminated):
-        print(f"terminated at timestep {t} for agents: {jnp.where(terminated)[0]}")
+        terminated_agents = jnp.where(terminated)[0]
+        print(f"Terminated at timestep {t} for agents: {terminated_agents}")
+    
     return terminated
  
 
   def truncation(self, state):
     t = int(state.timestep)
-    max_length = 1000  
-    truncated = t >= (max_length - 1)
-    if truncated:
-        print(f"Truncation reached at timestep {t}")
-    return jnp.array([truncated] * state.sim_trajectory.x.shape[0])
+    max_length = 1000
+    
+    region_of_interest = {"LON": (103.82, 103.88), "LAT": (1.15, 1.22)}
+    origin_lon, origin_lat = region_of_interest['LON'][0], region_of_interest['LAT'][0]
+    max_x = haversine_distance(origin_lon, origin_lat, region_of_interest['LON'][1], origin_lat)
+    max_y = haversine_distance(origin_lon, origin_lat, origin_lon, region_of_interest['LAT'][1])
+    
+    current_x = state.sim_trajectory.x[:, t]
+    current_y = state.sim_trajectory.y[:, t]
+    valid_agents = state.sim_trajectory.valid[:, t]
+    
+    min_x, min_y = 0.0, 0.0 
+    within_x_bounds = (current_x >= min_x) & (current_x <= max_x)
+    within_y_bounds = (current_y >= min_y) & (current_y <= max_y)
+    within_region = within_x_bounds & within_y_bounds
+    max_length_exceeded = t >= (max_length - 1)
+    truncated_per_agent = ((~within_region) | max_length_exceeded) & valid_agents
+    
+    if jnp.any(truncated_per_agent):
+        if max_length_exceeded:
+            print(f"Truncation reached at timestep {t} (max length)")
+        if jnp.any((~within_region) & valid_agents):
+            out_of_bounds_agents = jnp.where((~within_region) & valid_agents)[0]
+            print(f"Truncation: agents {out_of_bounds_agents} left region at timestep {t}")
+    
+    return truncated_per_agent
+
 
 
   def reset(
@@ -223,26 +252,79 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
   def observation_spec(self) -> types.Observation:
     raise NotImplementedError()
 
-  def observe_agent(self, state, agent_idx, n_neighbors=10):
-      """Returns a gym-compatible observation for a given agent at the current timestep."""
-      timestep = int(state.timestep)
-      # Ego history: (11, 4)
-      ego = np.array(state.sim_trajectory.ego_histories[agent_idx, timestep])
-      # Neighbors: (N, 11, 4)
-      neighbors = np.array(state.sim_trajectory.neighbor_histories[agent_idx, timestep])
-      # Pad or truncate neighbors to n_neighbors
-      if neighbors.shape[0] < n_neighbors:
-          pad = np.zeros((n_neighbors - neighbors.shape[0], 11, 4), dtype=neighbors.dtype)
-          neighbors = np.concatenate([neighbors, pad], axis=0)
-      elif neighbors.shape[0] > n_neighbors:
-          neighbors = neighbors[:n_neighbors]
-      # Goal: (2,)
-      goal = np.array(state.sim_trajectory.goals[agent_idx])
-      return {
-          'ego': ego,
-          'neighbors': neighbors,
-          'goal': goal,
-      }
+  def observe_agent(self,
+                  states_history: list,
+                  agent_idx: int,
+                  history_len: int = 10,
+                  n_neighbors: int = 10):
+    """
+    Dynamically builds a gym-compatible observation for an agent by replicating
+    the logic from build_observations.py using the simulated state history.
+    """
+    current_state = states_history[-1]
+    current_timestep = int(current_state.timestep)
+    
+    ego_history = np.zeros((history_len + 1, 4), dtype=np.float32)
+    for i in range(history_len + 1):
+        hist_step_idx = current_timestep - (history_len - i)
+        
+        if hist_step_idx >= 0 and hist_step_idx < len(states_history):
+            past_state = states_history[hist_step_idx]
+            ego_history[i, 0] = past_state.sim_trajectory.x[agent_idx, hist_step_idx]
+            ego_history[i, 1] = past_state.sim_trajectory.y[agent_idx, hist_step_idx]
+            ego_history[i, 2] = past_state.sim_trajectory.speed[agent_idx, hist_step_idx]
+            ego_history[i, 3] = past_state.sim_trajectory.yaw[agent_idx, hist_step_idx]
+            
+    ego_pos = np.array([
+        current_state.sim_trajectory.x[agent_idx, current_timestep],
+        current_state.sim_trajectory.y[agent_idx, current_timestep]
+    ])
+    
+    neighbor_candidates = []
+    num_total_agents = current_state.sim_trajectory.x.shape[0]
+    
+    for other_idx in range(num_total_agents):
+        if other_idx == agent_idx:
+            continue
+        
+        if not current_state.sim_trajectory.valid[other_idx, current_timestep]:
+            continue
+
+        other_pos = np.array([
+            current_state.sim_trajectory.x[other_idx, current_timestep],
+            current_state.sim_trajectory.y[other_idx, current_timestep]
+        ])
+        
+        distance = np.linalg.norm(ego_pos - other_pos)
+        neighbor_candidates.append({'id': other_idx, 'dist': distance})
+        
+    neighbor_candidates.sort(key=lambda x: x['dist'])
+    nearest_neighbor_idxs = [n['id'] for n in neighbor_candidates[:n_neighbors]]
+    
+    all_neighbors_history = []
+    for neighbor_idx in nearest_neighbor_idxs:
+        neighbor_history = np.zeros((history_len + 1, 4), dtype=np.float32)
+        for i in range(history_len + 1):
+            hist_step_idx = current_timestep - (history_len - i)
+            if hist_step_idx >= 0 and hist_step_idx < len(states_history):
+                past_state = states_history[hist_step_idx]
+                if past_state.sim_trajectory.valid[neighbor_idx, hist_step_idx]:
+                    neighbor_history[i, 0] = past_state.sim_trajectory.x[neighbor_idx, hist_step_idx]
+                    neighbor_history[i, 1] = past_state.sim_trajectory.y[neighbor_idx, hist_step_idx]
+                    neighbor_history[i, 2] = past_state.sim_trajectory.speed[neighbor_idx, hist_step_idx]
+                    neighbor_history[i, 3] = past_state.sim_trajectory.yaw[neighbor_idx, hist_step_idx]
+        all_neighbors_history.append(neighbor_history)
+        
+    while len(all_neighbors_history) < n_neighbors:
+        all_neighbors_history.append(np.zeros((history_len + 1, 4), dtype=np.float32))
+    goal = np.array(current_state.sim_trajectory.goals[agent_idx])
+    # if current_timestep in [0,1,2]:
+    #   print(f'ego history: {ego_history}')
+    return {
+        'ego': ego_history,
+        'neighbors': np.stack(all_neighbors_history, axis=0),
+        'goal': goal,
+    }
 
   @property
   def observation_space(self):

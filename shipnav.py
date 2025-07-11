@@ -24,11 +24,17 @@ import torch
 from waymax.agents.actor_core import WaymaxActorOutput
 import numpy as np
 import jax.numpy as jnp
+from maritime_rl.utils import haversine_distance
 
 with open('observations.pkl', 'rb') as f:
     observations = pickle.load(f)
 
-observations = observations[37:38]
+region_of_interest = {"LON": (103.82, 103.88), "LAT": (1.15, 1.22)}
+origin_lon, origin_lat = region_of_interest['LON'][0], region_of_interest['LAT'][0]
+max_x = haversine_distance(origin_lon, origin_lat, region_of_interest['LON'][1], origin_lat)
+max_y = haversine_distance(origin_lon, origin_lat, origin_lon, region_of_interest['LAT'][1])
+
+observations = observations[10:11]
 num_ships = len(observations)
 max_length = max(len(ship_obs) for ship_obs in observations)
 print(max_length)
@@ -147,33 +153,25 @@ env = MultiAgentEnvironment(
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_path = "model_weights/bc_weights.pth"
 
-
-bc_actor = BCActor(
-    model_path=model_path,
-    device=device,
-    dynamics_model=dynamics_model
-)
-
-# actor_const = agents.create_constant_speed_actor(
-#     speed=500.0,
-#     dynamics_model=dynamics_model,
-#     is_controlled_func=lambda state: obj_idx == 0
-# )
 
 actor_expert = agents.create_expert_actor(
     dynamics_model=dynamics_model
 )
 
-# actor_static = agents.create_expert_actor(
-#     dynamics_model=dynamics_model,
-#     is_controlled_func=lambda state: obj_idx > 1
-# )
+bc_actor = BCActor(
+    model_path="new_model_weights/bc_model_normalise.th",
+    device=device,
+    dynamics_model=dynamics_model,
+    environment=env,
+    normalize=True,  
+    max_x=max_x,
+    max_y=max_y
+)
 
 actor_list = [
-    (actor_expert, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids >= 0)),
-    # (bc_actor, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids > 0))
+    (actor_expert, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids > 0)),
+    (bc_actor, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids == 0))
 ]
 
 jit_step = jax.jit(env.step)
@@ -201,23 +199,21 @@ def no_op_action_for_agent(agent_idx, num_objects):
 
 
 states = [sim_state]
-done_mask = jnp.zeros(num_agents, dtype=bool)  # Track which agents are done
+done_mask = jnp.zeros(num_agents, dtype=bool)  
 done_mask_history = []
 
 for _ in range(max_length - 1):
     current_state = states[-1]
     outputs = [None] * num_agents
 
-    # For each agent, select action if not done, else no-op
     for agent_idx in range(num_agents):
-        # Find which actor controls this agent
         for (actor, is_controlled_func), jit_select_action in zip(actor_list, jit_select_action_list):
             if is_controlled_func(current_state)[agent_idx]:
                 if not done_mask[agent_idx]:
-                    outputs[agent_idx] = jit_select_action({}, current_state, int(agent_idx), None)
+                    outputs[agent_idx] = jit_select_action({}, current_state, int(agent_idx), states)
                 else:
                     outputs[agent_idx] = no_op_action_for_agent(agent_idx, num_agents)
-                break  # Only one actor per agent
+                break  
 
     action = agents.merge_actions(outputs)
     next_state = jit_step(current_state, action)
@@ -226,7 +222,7 @@ for _ in range(max_length - 1):
     terminated = env.termination(next_state)
     truncated = env.truncation(next_state)
     done_mask = jnp.logical_or(done_mask, jnp.logical_or(terminated, truncated))
-    done_mask_history.append(done_mask)
+    done_mask_history.append(done_mask.copy())
 
     if jnp.all(done_mask):
         break
@@ -243,19 +239,18 @@ for agent_idx in range(num_agents):
     if len(done_steps) > 0:
         first_done_step.append(int(done_steps[0]))
     else:
-        first_done_step.append(len(states) - 1)  # never done, use last step
+        first_done_step.append(len(states) - 1)  
 
 metrics = {
     'gc_ade': [],
     'goal_rate': [],
     'near_miss_rate': [],
-    'avg_drift': [],
     'avg_curvature': [],
 }
 
 num_steps = len(states)
-near_miss_threshold = 555
-goal_threshold = 200
+near_miss_threshold = 555  
+goal_threshold = 200  
 
 for agent_idx in range(num_ships):
     # Check if this agent is valid
@@ -265,27 +260,27 @@ for agent_idx in range(num_ships):
         metrics['gc_ade'].append(0.0)
         metrics['goal_rate'].append(False)
         metrics['near_miss_rate'].append(0.0)
-        metrics['avg_drift'].append(0.0)
         metrics['avg_curvature'].append(0.0)
         continue
     
     # Find the last valid timestep for this agent
     last_valid_idx = int(jnp.where(valid_mask)[0][-1])
     
-    expert_x = traj.x[agent_idx]
-    expert_y = traj.y[agent_idx]
+    # Determine the number of steps to consider (up to done step or last valid)
     T = min(first_done_step[agent_idx] + 1, last_valid_idx + 1)
     
+    # GC-ADE Calculation
+    expert_x = traj.x[agent_idx]
+    expert_y = traj.y[agent_idx]
     sim_x = jnp.array([state.sim_trajectory.x[agent_idx, int(state.timestep)] for state in states[:T]])
     sim_y = jnp.array([state.sim_trajectory.y[agent_idx, int(state.timestep)] for state in states[:T]])
     min_T = min(len(expert_x), len(sim_x))
     gc_ade = jnp.mean(jnp.sqrt((expert_x[:min_T] - sim_x[:min_T])**2 + (expert_y[:min_T] - sim_y[:min_T])**2))
     metrics['gc_ade'].append(float(gc_ade))
 
-    # Use the last valid position from simulated trajectory, not original trajectory
-    final_x = sim_x[-1]  # Use simulated trajectory
-    final_y = sim_y[-1]  # Use simulated trajectory
-
+    # Goal Reached Calculation (using simulated trajectory's final position)
+    final_x = sim_x[-1] if len(sim_x) > 0 else 0.0
+    final_y = sim_y[-1] if len(sim_y) > 0 else 0.0
     goal_x, goal_y = goal_positions[agent_idx]
     dist_to_goal = jnp.sqrt((final_x - goal_x)**2 + (final_y - goal_y)**2)
     print(f"Ship {agent_idx}: Final valid position = ({float(final_x):.2f}, {float(final_y):.2f}), "
@@ -294,77 +289,59 @@ for agent_idx in range(num_ships):
     goal_reached = dist_to_goal < goal_threshold
     metrics['goal_rate'].append(bool(goal_reached))
 
-    # Near miss rate
+    # Near Miss Rate Calculation
     near_miss_count = 0
-    N_NEIGHBORS = traj.neighbor_histories.shape[2]  
     for t in range(T):
         timestep_idx = int(states[t].timestep)
         x_i = states[t].sim_trajectory.x[agent_idx, timestep_idx]
         y_i = states[t].sim_trajectory.y[agent_idx, timestep_idx]
+        
+        # Only check neighbors (not all other ships)
         neighbors = states[t].sim_trajectory.neighbor_histories[agent_idx, timestep_idx]
-        near_miss_found = False
+        min_distance = float('inf')
+        
         for neighbor in neighbors:
             neighbor_x = neighbor[-1, 0]
             neighbor_y = neighbor[-1, 1]
             if neighbor_x == 0.0 and neighbor_y == 0.0:
-                continue  
+                continue
             dist = jnp.sqrt((x_i - neighbor_x)**2 + (y_i - neighbor_y)**2)
-            if dist < near_miss_threshold:
-                near_miss_count += 1
-                near_miss_found = True
-                break  
-        if not near_miss_found:
-            x_all = states[t].sim_trajectory.x[:, timestep_idx]
-            y_all = states[t].sim_trajectory.y[:, timestep_idx]
-            for j in range(num_ships):
-                if j == agent_idx:
-                    continue
-                other_x = x_all[j]
-                other_y = y_all[j]
-                dist = jnp.sqrt((x_i - other_x)**2 + (y_i - other_y)**2)
-                if dist < near_miss_threshold:
-                    near_miss_count += 1
-                    break  
-    near_miss_rate = 100 * near_miss_count / T
+            min_distance = min(min_distance, dist)
+        
+        # Count near miss if closest neighbor distance is below threshold
+        if min_distance < near_miss_threshold and min_distance != float('inf'):
+            near_miss_count += 1
+
+    # Calculate rate as percentage of timesteps with near misses
+    near_miss_rate = 100 * near_miss_count / T if T > 0 else 0.0
     metrics['near_miss_rate'].append(float(near_miss_rate))
 
-    # Drift
-    drifts = []
-    for t in range(1, T):
-        x0 = sim_x[t - 1]
-        y0 = sim_y[t - 1]
-        x1 = sim_x[t]
-        y1 = sim_y[t]
-        yaw = states[t].sim_trajectory.yaw[agent_idx, int(states[t].timestep)]
-        course = jnp.arctan2(y1 - y0, x1 - x0)
-        drift = (course - yaw + jnp.pi) % (2 * jnp.pi) - jnp.pi
-        drifts.append(jnp.abs(drift))
-    avg_drift = jnp.mean(jnp.array(drifts)) if drifts else 0.0
-    metrics['avg_drift'].append(float(jnp.degrees(avg_drift)))
-
-    # Curvature
     curvatures = []
-    for t in range(1, T - 1):
-        p1 = jnp.array([sim_x[t - 1], sim_y[t - 1]])
-        p2 = jnp.array([sim_x[t], sim_y[t]])
-        p3 = jnp.array([sim_x[t + 1], sim_y[t + 1]])
-        a = jnp.linalg.norm(p1 - p2)
-        b = jnp.linalg.norm(p2 - p3)
-        c = jnp.linalg.norm(p3 - p1)
-        if a * b * c == 0:
-            curvature = 0.0
-        else:
-            curvature = 4 * jnp.abs((p2[0]-p1[0])*(p3[1]-p1[1]) - (p2[1]-p1[1])*(p3[0]-p1[0])) / (a * b * c)
-        curvatures.append(curvature)
+    for t in range(1, T):
+        if t < T - 1:
+            x0, y0 = sim_x[t-1], sim_y[t-1]
+            x1, y1 = sim_x[t], sim_y[t]
+            x2, y2 = sim_x[t+1], sim_y[t+1]
+            dx_dt = (x1 - x0) / 10.0  
+            dy_dt = (y1 - y0) / 10.0
+            d2x_dt2 = (x2 - 2*x1 + x0) / 10.0
+            d2y_dt2 = (y2 - 2*y1 + y0) / 10.0
+            velocity_mag_squared = dx_dt**2 + dy_dt**2
+            if velocity_mag_squared < 1e-3:
+                curvature = 0.0  
+            else:
+                denominator = velocity_mag_squared ** 1.5
+                curvature = (dx_dt * d2y_dt2 - dy_dt * d2x_dt2) / denominator
+            curvatures.append(curvature)
     avg_curvature = jnp.mean(jnp.array(curvatures)) if curvatures else 0.0
     metrics['avg_curvature'].append(float(avg_curvature))
-
+# Display Metrics
 for i in range(num_ships):
     print(f"Ship {i} | GC-ADE: {metrics['gc_ade'][i]:.2f} m | "
           f"Goal Reached: {metrics['goal_rate'][i]} | "
-          f"Near Miss Rate: {metrics['near_miss_rate'][i]}% | "
-          f"Avg Drift: {metrics['avg_drift'][i]} deg | "
-          f"Avg Curvature: {metrics['avg_curvature'][i]}")
+          f"Near Miss Rate: {metrics['near_miss_rate'][i]:.3f}% | "
+          f"Avg Curvature: {metrics['avg_curvature'][i]:.5f}")
+
 
 # agent_idx = 0
 # print("Testing observe_agent for agent", agent_idx)
@@ -481,16 +458,21 @@ def render_global_state(state, goal_positions, step_idx=None, wake_length=5):
 
 # mediapy.write_video("ship_simulation.mp4", imgs, fps=TARGET_FPS)
 
+
+##Debugging purposes
+
 # ship_idx = 0
-# timestep = 0
+# timestep = 1
 
-# print("Ego history at timestep", timestep)
-# print(sim_state.sim_trajectory.ego_histories[ship_idx, timestep])
-# print("Shape:", sim_state.sim_trajectory.ego_histories[ship_idx, timestep].shape)
+# print("=== LOG TRAJECTORY (Original) ===")
+# print(f"X: {sim_state.log_trajectory.x[ship_idx, timestep]}")
+# print(f"Y: {sim_state.log_trajectory.y[ship_idx, timestep]}")
+# print(f"Speed: {sim_state.log_trajectory.speed[ship_idx, timestep]}")
+# print(f"Yaw: {sim_state.log_trajectory.yaw[ship_idx, timestep]}")
 
-# print("\nNeighbor histories at timestep", timestep)
-# # print(sim_state.sim_trajectory.neighbor_histories[ship_idx, timestep])
-# print("Shape:", sim_state.sim_trajectory.neighbor_histories[ship_idx, timestep].shape)
+# print("\n=== SIM TRAJECTORY (Simulated) ===")
+# print(f"X: {states[timestep].sim_trajectory.x[ship_idx, timestep]}")
+# print(f"Y: {states[timestep].sim_trajectory.y[ship_idx, timestep]}")
+# print(f"Speed: {states[timestep].sim_trajectory.speed[ship_idx, timestep]}")
+# print(f"Yaw: {states[timestep].sim_trajectory.yaw[ship_idx, timestep]}")
 
-# print("\nGoal position")
-# print(sim_state.sim_trajectory.goals[ship_idx])
