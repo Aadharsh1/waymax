@@ -14,4 +14,3 @@ venv/
 
 # Ignore directories containing datasets and model weights
 trajs_times/
-new_model_weights/
