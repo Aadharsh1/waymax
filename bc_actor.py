@@ -15,7 +15,6 @@ class BCActor:
         self.normalize = normalize
         self.max_x = max_x
         self.max_y = max_y
-        
         self.policy = torch.load(model_path, map_location=self.device, weights_only=False)
         self.policy.eval()
         
@@ -50,12 +49,22 @@ class BCActor:
 
     def select_action(self, rng_key, state, agent_idx, states_history: list):
         obs = self.environment.observe_agent(
-        states_history=states_history,
-        agent_idx=agent_idx,
-        n_neighbors=10, 
-        history_len=10
-    )
-        
+            states_history=states_history,
+            agent_idx=agent_idx,
+            n_neighbors=10, 
+            history_len=5
+        )
+
+        # DEBUG: Print raw observation before normalization
+        # timestep = int(state.timestep)
+        # if timestep == 1:
+        #     print(agent_idx)
+        #     print("Raw inference observation:")
+        #     print("ego :", obs['ego'])
+        #     print("neighbor values:\n", obs['neighbors'])
+        #     print("Goal:", obs['goal'])
+        #     print("-" * 40)
+
         if self.normalize:
             obs = self._normalize_observation(obs)
         
@@ -69,6 +78,7 @@ class BCActor:
             action_np = self.policy.predict(obs_dict, deterministic=True)[0]
 
         dx, dy, dheading = action_np
+        # print(dx, dy, dheading)
         
         # Get current state
         timestep = int(state.timestep)
@@ -76,28 +86,51 @@ class BCActor:
         y_current = state.sim_trajectory.y[agent_idx, timestep]
         yaw_current = state.sim_trajectory.yaw[agent_idx, timestep]
         
-        # Apply action to get new state
+        # Apply relative displacements
         x_new = x_current + dx
         y_new = y_current + dy
         yaw_new = (yaw_current + dheading) % (2 * np.pi)
+        
+        
+        # Calculate velocities
         dt = 10.0
         vel_x = dx / dt
         vel_y = dy / dt
-        # if timestep in [0,1]:
-        #     print(f'x_new {x_new} y_new {y_new}')
         
-        # Create action in Waymax format
         num_objects = state.sim_trajectory.x.shape[0]
-
-        action_data = jnp.zeros((num_objects, 5), dtype=jnp.float32).at[agent_idx].set(
-            jnp.array([x_new, y_new, yaw_new, vel_x, vel_y], dtype=jnp.float32)
-        )
+       
+        action_x = jnp.expand_dims(state.sim_trajectory.x[:, timestep], axis=1)
+        action_y = jnp.expand_dims(state.sim_trajectory.y[:, timestep], axis=1)
+        action_yaw = jnp.expand_dims(state.sim_trajectory.yaw[:, timestep], axis=1)
+        action_vel_x = jnp.expand_dims(state.sim_trajectory.vel_x[:, timestep], axis=1)
+        action_vel_y = jnp.expand_dims(state.sim_trajectory.vel_y[:, timestep], axis=1)
+        action_valid = jnp.expand_dims(state.sim_trajectory.valid[:, timestep], axis=1)
         
-        valid = jnp.zeros((num_objects, 1), dtype=bool).at[agent_idx, 0].set(True)
+        # Update only the controlled agent
+        action_x = action_x.at[agent_idx, 0].set(x_new)
+        action_y = action_y.at[agent_idx, 0].set(y_new)
+        action_yaw = action_yaw.at[agent_idx, 0].set(yaw_new)
+        action_vel_x = action_vel_x.at[agent_idx, 0].set(vel_x)
+        action_vel_y = action_vel_y.at[agent_idx, 0].set(vel_y)
+        action_valid = action_valid.at[agent_idx, 0].set(True)
+        
+        # Create proper TrajectoryUpdate action
+        from waymax.datatypes import TrajectoryUpdate
+        action = TrajectoryUpdate(
+            x=action_x,
+            y=action_y,
+            yaw=action_yaw,
+            vel_x=action_vel_x,
+            vel_y=action_vel_y,
+            valid=action_valid,
+        ).as_action()
+        
+        # Create is_controlled mask
         is_ctrl = jnp.zeros((num_objects,), dtype=bool).at[agent_idx].set(True)
         
         return WaymaxActorOutput(
             actor_state=None,
-            action=Action(data=action_data, valid=valid),
+            action=action,
             is_controlled=is_ctrl
         )
+

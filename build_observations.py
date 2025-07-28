@@ -2,7 +2,7 @@ import pickle
 import numpy as np
 from tqdm import tqdm
 
-with open('./trajs_times/trajs_times_tw.pkl', 'rb') as f:
+with open('./trajs_times/trajs_times.pkl', 'rb') as f:
     data = pickle.load(f)
     
 trajs = data['trajs']
@@ -50,7 +50,7 @@ def find_temporal_neighbors(all_trajs, all_times, current_ship_idx, t, N, time_t
     
     return nearest_neighbors
 
-def build_observations(trajs, times, N=10, history_length=10, time_tolerance=6):
+def build_observations(trajs, times, N=10, history_length=5, time_tolerance=6):
     num_ships = len(trajs)
     observations = []
     
@@ -113,7 +113,7 @@ def build_observations(trajs, times, N=10, history_length=10, time_tolerance=6):
     
     return observations
 
-observations = build_observations(trajs, times, N=10, history_length=10, time_tolerance=6)
+observations = build_observations(trajs, times, N=10, history_length=5, time_tolerance=6)
 
 # Save observations
 with open('observations.pkl', 'wb') as f:

@@ -34,6 +34,17 @@ from gymnasium import spaces
 from maritime_rl.utils import haversine_distance
 
 
+
+def get_padded_history(traj, t, history_len=5):  # Change parameter name
+    start = max(0, t - history_len)
+    history = traj[start:t+1]
+    pad_len = history_len + 1 - history.shape[0]
+    if pad_len > 0:
+        padding = np.zeros((pad_len, 4), dtype=traj.dtype)
+        history = np.vstack([padding, history])
+    return history
+
+
 class BaseEnvironment(abstract_environment.AbstractEnvironment):
   """Waymax environment for multi-agent scenarios."""
 
@@ -79,9 +90,9 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
     goal_threshold = 200.0
     terminated = (dist < goal_threshold) & valid_agents
     
-    if jnp.any(terminated):
-        terminated_agents = jnp.where(terminated)[0]
-        print(f"Terminated at timestep {t} for agents: {terminated_agents}")
+    # if jnp.any(terminated):
+    #     terminated_agents = jnp.where(terminated)[0]
+    #     print(f"Terminated at timestep {t} for agents: {terminated_agents}")
     
     return terminated
  
@@ -106,12 +117,12 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
     max_length_exceeded = t >= (max_length - 1)
     truncated_per_agent = ((~within_region) | max_length_exceeded) & valid_agents
     
-    if jnp.any(truncated_per_agent):
-        if max_length_exceeded:
-            print(f"Truncation reached at timestep {t} (max length)")
-        if jnp.any((~within_region) & valid_agents):
-            out_of_bounds_agents = jnp.where((~within_region) & valid_agents)[0]
-            print(f"Truncation: agents {out_of_bounds_agents} left region at timestep {t}")
+    # if jnp.any(truncated_per_agent):
+    #     if max_length_exceeded:
+    #         print(f"Truncation reached at timestep {t} (max length)")
+    #     if jnp.any((~within_region) & valid_agents):
+    #         out_of_bounds_agents = jnp.where((~within_region) & valid_agents)[0]
+    #         print(f"Truncation: agents {out_of_bounds_agents} left region at timestep {t}")
     
     return truncated_per_agent
 
@@ -251,86 +262,96 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
 
   def observation_spec(self) -> types.Observation:
     raise NotImplementedError()
+  
 
   def observe_agent(self,
-                  states_history: list,
-                  agent_idx: int,
-                  history_len: int = 10,
-                  n_neighbors: int = 10):
-    """
-    Dynamically builds a gym-compatible observation for an agent by replicating
-    the logic from build_observations.py using the simulated state history.
-    """
+              states_history: list,
+              agent_idx: int,
+              trajs: list,  # Original trajectory data
+              times: list,  # Original time data
+              overlap_idx: list,  # Add this parameter
+              ego_start_time: float,  # Starting time for this ego agent
+              history_len: int = 5,
+              n_neighbors: int = 10):
+
+    
     current_state = states_history[-1]
     current_timestep = int(current_state.timestep)
     
+    # Calculate current time based on simulation timestep
+    current_time = ego_start_time + (current_timestep * 10.0)  # Assuming 10s intervals
+    
+    # --- 1. Build Ego History from Simulation (Closed-Loop) ---
     ego_history = np.zeros((history_len + 1, 4), dtype=np.float32)
     for i in range(history_len + 1):
-        hist_step_idx = current_timestep - (history_len - i)
-        
-        if hist_step_idx >= 0 and hist_step_idx < len(states_history):
-            past_state = states_history[hist_step_idx]
-            ego_history[i, 0] = past_state.sim_trajectory.x[agent_idx, hist_step_idx]
-            ego_history[i, 1] = past_state.sim_trajectory.y[agent_idx, hist_step_idx]
-            ego_history[i, 2] = past_state.sim_trajectory.speed[agent_idx, hist_step_idx]
-            ego_history[i, 3] = past_state.sim_trajectory.yaw[agent_idx, hist_step_idx]
-            
-    ego_pos = np.array([
-        current_state.sim_trajectory.x[agent_idx, current_timestep],
-        current_state.sim_trajectory.y[agent_idx, current_timestep]
-    ])
-    
-    neighbor_candidates = []
-    num_total_agents = current_state.sim_trajectory.x.shape[0]
-    
-    for other_idx in range(num_total_agents):
-        if other_idx == agent_idx:
-            continue
-        
-        if not current_state.sim_trajectory.valid[other_idx, current_timestep]:
-            continue
+        history_offset = history_len - i
+        if history_offset < len(states_history):
+            past_state = states_history[-(history_offset + 1)]
+            past_timestep = int(past_state.timestep)
+            if past_timestep >= 0:
+                ego_history[i, 0] = past_state.sim_trajectory.x[agent_idx, past_timestep]
+                ego_history[i, 1] = past_state.sim_trajectory.y[agent_idx, past_timestep]
+                ego_history[i, 2] = past_state.sim_trajectory.speed[agent_idx, past_timestep]
+                ego_history[i, 3] = past_state.sim_trajectory.yaw[agent_idx, past_timestep]
 
-        other_pos = np.array([
-            current_state.sim_trajectory.x[other_idx, current_timestep],
-            current_state.sim_trajectory.y[other_idx, current_timestep]
-        ])
-        
-        distance = np.linalg.norm(ego_pos - other_pos)
-        neighbor_candidates.append({'id': other_idx, 'dist': distance})
-        
-    neighbor_candidates.sort(key=lambda x: x['dist'])
-    nearest_neighbor_idxs = [n['id'] for n in neighbor_candidates[:n_neighbors]]
+    # --- 2. Find Neighbors using Original Method with overlap_idx ---
+    ego_pos_current = ego_history[-1, :2]
+    neighbor_candidates = []
     
-    all_neighbors_history = []
-    for neighbor_idx in nearest_neighbor_idxs:
-        neighbor_history = np.zeros((history_len + 1, 4), dtype=np.float32)
-        for i in range(history_len + 1):
-            hist_step_idx = current_timestep - (history_len - i)
-            if hist_step_idx >= 0 and hist_step_idx < len(states_history):
-                past_state = states_history[hist_step_idx]
-                if past_state.sim_trajectory.valid[neighbor_idx, hist_step_idx]:
-                    neighbor_history[i, 0] = past_state.sim_trajectory.x[neighbor_idx, hist_step_idx]
-                    neighbor_history[i, 1] = past_state.sim_trajectory.y[neighbor_idx, hist_step_idx]
-                    neighbor_history[i, 2] = past_state.sim_trajectory.speed[neighbor_idx, hist_step_idx]
-                    neighbor_history[i, 3] = past_state.sim_trajectory.yaw[neighbor_idx, hist_step_idx]
-        all_neighbors_history.append(neighbor_history)
+    for ship_idx in overlap_idx[agent_idx]:
+        if ship_idx == agent_idx:
+            continue
         
-    while len(all_neighbors_history) < n_neighbors:
-        all_neighbors_history.append(np.zeros((history_len + 1, 4), dtype=np.float32))
+        traj = trajs[ship_idx]
+        ship_times = times[ship_idx]
+        
+        time_diffs = np.abs(ship_times - current_time)
+        min_time_diff_idx = np.argmin(time_diffs)
+        
+        ship_pos = traj[min_time_diff_idx, :2]
+        distance = np.linalg.norm(ego_pos_current - ship_pos)
+        
+        neighbor_candidates.append((ship_idx, min_time_diff_idx, distance))
+    
+    neighbor_candidates.sort(key=lambda x: x[2])
+    nearest_neighbors = [ship_idx for ship_idx, _, _ in neighbor_candidates[:n_neighbors]]
+    
+    while len(nearest_neighbors) < n_neighbors:
+        nearest_neighbors.append(-1)
+    
+    # --- 3. Build Neighbor Histories EXACTLY like training ---
+    all_neighbors_history = []
+    
+    for n_idx in nearest_neighbors:
+        if n_idx == -1:
+            all_neighbors_history.append(np.zeros((history_len + 1, 4), dtype=np.float32))
+        else:
+            # MATCH TRAINING: Find best time match for current_time, then use get_padded_history
+            neighbor_times = times[n_idx]
+            time_diffs = np.abs(neighbor_times - current_time)
+            best_neighbor_t = np.argmin(time_diffs)
+            
+            # Use the SAME get_padded_history function as training
+            neighbor_history = get_padded_history(trajs[n_idx], best_neighbor_t, history_len)
+            all_neighbors_history.append(neighbor_history)
+    
+    neighbors_array = np.stack(all_neighbors_history, axis=0)
+    
     goal = np.array(current_state.sim_trajectory.goals[agent_idx])
-    # if current_timestep in [0,1,2]:
-    #   print(f'ego history: {ego_history}')
+    
     return {
         'ego': ego_history,
-        'neighbors': np.stack(all_neighbors_history, axis=0),
+        'neighbors': neighbors_array,
         'goal': goal,
     }
+  
+
 
   @property
   def observation_space(self):
       return spaces.Dict({
-          'ego': spaces.Box(low=-np.inf, high=np.inf, shape=(11, 4), dtype=np.float32),
-          'neighbors': spaces.Box(low=-np.inf, high=np.inf, shape=(10, 11, 4), dtype=np.float32),
+          'ego': spaces.Box(low=-np.inf, high=np.inf, shape=(6, 4), dtype=np.float32),
+          'neighbors': spaces.Box(low=-np.inf, high=np.inf, shape=(10, 6, 4), dtype=np.float32),
           'goal': spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
       })
 

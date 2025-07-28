@@ -9,6 +9,7 @@ from imitation.data import types, rollout
 from imitation.util import logger as imit_logger
 from utils import haversine_distance
 import argparse
+import wandb
 
 region_of_interest = {"LON": (103.82, 103.88), "LAT": (1.15, 1.22)}
 origin_lon, origin_lat = region_of_interest['LON'][0], region_of_interest['LAT'][0]
@@ -30,8 +31,9 @@ else:
     obs_low = np.array([0, 0, 0, 0], dtype=np.float32)
     obs_high = np.array([max_x, max_y, 1000, 2*np.pi], dtype=np.float32)
 
-ego_obs_shape = (11, 4)
-neighbor_obs_shape = (10, 11, 4)
+ego_obs_shape = (6, 4)
+neighbor_obs_shape = (10, 6, 4)
+
 
 #Define observation space
 obs_space = gym.spaces.Dict({
@@ -63,38 +65,40 @@ action_space = spaces.Box(
     dtype=np.float32
 )
 
-#Load the observations
-with open('observations.pkl', 'rb') as f:
-        observations = pickle.load(f)
+
+#Load the observations 
+with open('observations_original.pkl', 'rb') as f:
+	observations = pickle.load(f)
 
 
 im_trajs = []
 for ship_idx, ship_obs in enumerate(observations):
     if len(ship_obs) < 2:
         continue
-
+        
     T = len(ship_obs) - 1
     obs_list, act_list, rew_list = [], [], []
 
     for t in range(T):
         obs = ship_obs[t]
         next_obs = ship_obs[t+1]
-
+        
         dx = next_obs['ego'][-1, 0] - obs['ego'][-1, 0]
         dy = next_obs['ego'][-1, 1] - obs['ego'][-1, 1]
         dheading = (next_obs['ego'][-1, 3] - obs['ego'][-1, 3] + np.pi) % (2 * np.pi) - np.pi
         action = np.array([dx, dy, dheading], dtype=np.float32)
-
+        
         obs_list.append(obs)
         act_list.append(action)
         rew_list.append(0.0)
-
+    
 
     obs_list.append(ship_obs[-1])
 
     ego_stack = np.stack([o['ego'] for o in obs_list]).astype(np.float32)
     neighbors_stack = np.stack([o['neighbors'] for o in obs_list]).astype(np.float32)
     goal_stack = np.stack([o['goal'] for o in obs_list]).astype(np.float32)
+
     obs_dict = {
         'ego': ego_stack,
         'neighbors': neighbors_stack,
@@ -107,20 +111,46 @@ for ship_idx, ship_obs in enumerate(observations):
     dict_obs = types.DictObs(obs_dict)
 
     im_trajs.append(types.TrajectoryWithRew(
-        obs=dict_obs,
+        obs=dict_obs,  
         acts=acts,
         infos=None,
         terminal=True,
         rews=rews
     ))
 
-total_obs = sum(len(traj.obs) for traj in im_trajs)
+total_obs = sum(len(traj.obs) for traj in im_trajs) 
 total_actions = sum(len(traj.acts) for traj in im_trajs)
 print(f"Total observations across all trajectories: {total_obs}")
 print(f"Total actions across all trajectories: {total_actions}")
 
 # Flatten trajectories
 transitions = rollout.flatten_trajectories(im_trajs)
+
+lr = 1e-4
+epoch = 300
+batch = 256
+l2_w = 0.001
+#l2_orig = 0.001
+#batch orig = 256 
+run_name = 'bc_original_epoch300'
+
+wandb.init(
+    project="ShipNavism",
+    name=run_name,
+    config={
+        "learning_rate": lr,  
+        "epochs": epoch,
+        "batch_size": batch,
+        "l2_weight": l2_w,
+        "policy": "DetPolicy",
+        "architecture": "CustomExtractor_256",
+        "dataset_size": len(transitions)
+    }
+)
+
+wandb.define_metric("epoch")
+wandb.define_metric("rollout/*", step_metric="epoch")
+wandb.define_metric("train/*", step_metric="epoch")
 
 tb_logdir = "logs/BC"
 custom_logger = imit_logger.configure(
@@ -143,13 +173,13 @@ bc_trainer = det_bc.BC(
     demonstrations=transitions,
     rng=rng,
     policy=policy,
-    l2_weight=0.001,
-    batch_size=256,
+    l2_weight=l2_w,
+    batch_size=batch,
     custom_logger=custom_logger
 )
 
 print(f"Training on {len(transitions.acts)} transitions from {len(im_trajs)} trajectories...")
-bc_trainer.train(n_epochs=100)
+bc_trainer.train(n_epochs=epoch)
 
 
 stats = rollout.rollout_stats(im_trajs)
@@ -157,8 +187,21 @@ print("Rollout stats:")
 for k, v in stats.items():
     print(f"{k}: {v}")
 
+model_filename = f"{run_name}.th"
 os.makedirs("new_model_weights", exist_ok=True)
-model_path = os.path.join("new_model_weights", "bc_model_normalise.th")
+model_path = os.path.join("new_model_weights", model_filename)
 th.save(bc_trainer.policy, model_path)
 print(f"Model saved to {model_path}")
 
+print("Saving model to WandB as an Artifact...")
+model_artifact = wandb.Artifact(
+    name=run_name, 
+    type="model",
+    description="Trained Behavioral Cloning policy for ship navigation.",
+    metadata=dict(wandb.config) 
+)
+
+model_artifact.add_file(model_path)
+wandb.log_artifact(model_artifact)
+print("Model artifact successfully saved to WandB.")
+wandb.finish()

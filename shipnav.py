@@ -25,8 +25,69 @@ from waymax.agents.actor_core import WaymaxActorOutput
 import numpy as np
 import jax.numpy as jnp
 from maritime_rl.utils import haversine_distance
+from waymax import datatypes
 
-with open('observations.pkl', 'rb') as f:
+class CustomShipDynamics(dynamics.StateDynamics):
+    def forward(self, action: datatypes.Action,
+                trajectory: datatypes.Trajectory,  
+                reference_trajectory: datatypes.Trajectory,
+                is_controlled: jnp.ndarray,
+                timestep: jnp.ndarray,
+                allow_object_injection: bool) -> datatypes.Trajectory:
+
+        updated_base_trajectory = super().forward(
+            action=action,
+            trajectory=trajectory,
+            reference_trajectory=reference_trajectory,
+            is_controlled=is_controlled,
+            timestep=timestep,
+            allow_object_injection=allow_object_injection
+        )
+
+        return trajectory.replace(
+            x=updated_base_trajectory.x,
+            y=updated_base_trajectory.y,
+            speed=updated_base_trajectory.speed,
+            yaw=updated_base_trajectory.yaw,
+            vel_x=updated_base_trajectory.vel_x,
+            vel_y=updated_base_trajectory.vel_y,
+            valid=updated_base_trajectory.valid,
+            timestamp_micros=updated_base_trajectory.timestamp_micros,
+            ego_histories=trajectory.ego_histories,
+            neighbor_histories=trajectory.neighbor_histories,
+            goals=trajectory.goals
+        )
+
+class CustomEnvironment(MultiAgentEnvironment):
+    def __init__(self, dynamics_model, config, trajs, times, overlap_idx, original_ship_indices):  # Add overlap_idx
+        super().__init__(dynamics_model, config)
+        self.trajs = trajs
+        self.times = times
+        self.overlap_idx = overlap_idx  # Add this
+        self.original_ship_indices = original_ship_indices 
+        self.ego_start_times = [times[idx][0] for idx in original_ship_indices]
+    
+    def observe_agent(self, states_history, agent_idx, **kwargs):
+        original_agent_idx = self.original_ship_indices[agent_idx]
+        
+        return super().observe_agent(
+            states_history=states_history,
+            agent_idx=original_agent_idx,  
+            trajs=self.trajs,
+            times=self.times,
+            overlap_idx=self.overlap_idx,  # Add this
+            ego_start_time=self.ego_start_times[agent_idx],
+            **kwargs
+        )
+
+with open('./trajs_times/trajs_times_overlap.pkl', 'rb') as f:  
+    data = pickle.load(f)
+
+trajs = data['trajs']
+times = data['times']
+overlap_idx = data['overlap_idx']  
+
+with open('observations_original.pkl', 'rb') as f:
     observations = pickle.load(f)
 
 region_of_interest = {"LON": (103.82, 103.88), "LAT": (1.15, 1.22)}
@@ -34,7 +95,8 @@ origin_lon, origin_lat = region_of_interest['LON'][0], region_of_interest['LAT']
 max_x = haversine_distance(origin_lon, origin_lat, region_of_interest['LON'][1], origin_lat)
 max_y = haversine_distance(origin_lon, origin_lat, origin_lon, region_of_interest['LAT'][1])
 
-observations = observations[10:11]
+SHIP_INDICES = [55]
+observations = [observations[i] for i in SHIP_INDICES]
 num_ships = len(observations)
 max_length = max(len(ship_obs) for ship_obs in observations)
 print(max_length)
@@ -43,8 +105,12 @@ neighbor_histories_all = []
 goal_positions = []
 x, y, speed, heading, valid = [], [], [], [], []
 
+NUM_NEIGHBORS = 10  
+HISTORY_STEPS = 5
+
 for ship_idx in range(num_ships):
     ship_obs = observations[ship_idx]
+    # print(len(ship_obs))
     episode_x, episode_y, episode_speed, episode_heading, episode_valid = [], [], [], [], []
     ego_histories_this_episode = []
     neighbor_histories_this_episode = []
@@ -77,8 +143,8 @@ for ship_idx in range(num_ships):
     episode_heading += [0.0] * pad_len
     episode_valid += [False] * pad_len
 
-    ego_histories_this_episode += [np.zeros((11, 4), dtype=np.float32)] * pad_len
-    neighbor_histories_this_episode += [np.zeros((10, 11, 4), dtype=np.float32)] * pad_len
+    ego_histories_this_episode += [np.zeros((HISTORY_STEPS + 1, 4), dtype=np.float32)] * pad_len
+    neighbor_histories_this_episode += [np.zeros((NUM_NEIGHBORS, HISTORY_STEPS + 1, 4), dtype=np.float32)] * pad_len
 
     x.append(episode_x)
     y.append(episode_y)
@@ -141,41 +207,51 @@ sim_state = SimulatorState(
     timestep=jnp.array(0),
 )
 
-dynamics_model = dynamics.StateDynamics()
-env = MultiAgentEnvironment(
+
+
+dynamics_model = CustomShipDynamics()
+
+
+env = CustomEnvironment(
     dynamics_model=dynamics_model,
     config=dataclasses.replace(
         EnvironmentConfig(),
         max_num_objects=num_ships,
         controlled_object=ObjectType.VALID
-    )
+    ),
+    trajs=trajs,
+    times=times,
+    overlap_idx=overlap_idx,  
+    original_ship_indices=SHIP_INDICES 
 )
-
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 actor_expert = agents.create_expert_actor(
-    dynamics_model=dynamics_model
+    dynamics_model=CustomShipDynamics()
 )
 
 bc_actor = BCActor(
-    model_path="new_model_weights/bc_model_normalise.th",
+    model_path="new_model_weights/bc_original_epoch300.th",
     device=device,
     dynamics_model=dynamics_model,
     environment=env,
-    normalize=True,  
+    normalize=False,  
     max_x=max_x,
     max_y=max_y
 )
 
+
+expert_agent_ids = jnp.array([])    
+bc_agent_ids = jnp.array([0])
+
 actor_list = [
-    (actor_expert, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids > 0)),
-    (bc_actor, lambda state: (state.object_metadata.is_controlled) & (state.object_metadata.ids == 0))
+    (actor_expert, lambda state: jnp.isin(state.object_metadata.ids, expert_agent_ids)),
+    (bc_actor, lambda state: jnp.isin(state.object_metadata.ids, bc_agent_ids))
 ]
 
 jit_step = jax.jit(env.step)
-# jit_select_action_list = [jax.jit(actor.select_action) for actor in actors]
 
 jit_select_action_list = []
 for actor, _ in actor_list:
@@ -201,6 +277,7 @@ def no_op_action_for_agent(agent_idx, num_objects):
 states = [sim_state]
 done_mask = jnp.zeros(num_agents, dtype=bool)  
 done_mask_history = []
+
 
 for _ in range(max_length - 1):
     current_state = states[-1]
@@ -237,9 +314,10 @@ first_done_step = []
 for agent_idx in range(num_agents):
     done_steps = jnp.where(done_mask_history[:, agent_idx])[0]
     if len(done_steps) > 0:
-        first_done_step.append(int(done_steps[0]))
+        first_done_step.append(int(done_steps[0])+1)
     else:
         first_done_step.append(len(states) - 1)  
+
 
 metrics = {
     'gc_ade': [],
@@ -292,16 +370,26 @@ for agent_idx in range(num_ships):
     # Near Miss Rate Calculation
     near_miss_count = 0
     for t in range(T):
+        if t >= len(states):
+            break
+            
+        # Get dynamic neighbors using observe_agent
+        obs = env.observe_agent(states[:t+1], agent_idx)
+        neighbors = obs['neighbors']
+        
         timestep_idx = int(states[t].timestep)
         x_i = states[t].sim_trajectory.x[agent_idx, timestep_idx]
         y_i = states[t].sim_trajectory.y[agent_idx, timestep_idx]
         
-        # Only check neighbors (not all other ships)
-        neighbors = states[t].sim_trajectory.neighbor_histories[agent_idx, timestep_idx]
+        # Skip if position is (0,0) - likely invalid
+        if x_i == 0.0 and y_i == 0.0:
+            continue
+            
         min_distance = float('inf')
         
+        # Use current neighbor positions from observe_agent
         for neighbor in neighbors:
-            neighbor_x = neighbor[-1, 0]
+            neighbor_x = neighbor[-1, 0]  # Current neighbor position
             neighbor_y = neighbor[-1, 1]
             if neighbor_x == 0.0 and neighbor_y == 0.0:
                 continue
@@ -317,15 +405,16 @@ for agent_idx in range(num_ships):
     metrics['near_miss_rate'].append(float(near_miss_rate))
 
     curvatures = []
+    dt = 10.0
     for t in range(1, T):
         if t < T - 1:
             x0, y0 = sim_x[t-1], sim_y[t-1]
             x1, y1 = sim_x[t], sim_y[t]
             x2, y2 = sim_x[t+1], sim_y[t+1]
-            dx_dt = (x1 - x0) / 10.0  
-            dy_dt = (y1 - y0) / 10.0
-            d2x_dt2 = (x2 - 2*x1 + x0) / 10.0
-            d2y_dt2 = (y2 - 2*y1 + y0) / 10.0
+            dx_dt = (x1 - x0) / dt  
+            dy_dt = (y1 - y0) / dt
+            d2x_dt2 = (x2 - 2*x1 + x0) / dt
+            d2y_dt2 = (y2 - 2*y1 + y0) / dt
             velocity_mag_squared = dx_dt**2 + dy_dt**2
             if velocity_mag_squared < 1e-3:
                 curvature = 0.0  
@@ -343,18 +432,7 @@ for i in range(num_ships):
           f"Avg Curvature: {metrics['avg_curvature'][i]:.5f}")
 
 
-# agent_idx = 0
-# print("Testing observe_agent for agent", agent_idx)
-# for t in range(3):
-#     state = states[t]
-#     obs = env.observe_agent(state, agent_idx)
-#     print(f"\nTimestep {t}:")
-#     print("ego shape:", obs['ego'].shape)
-#     print("ego:", obs['ego'])
-#     print("neighbors shape:", obs['neighbors'].shape)
-#     print("neighbors:", obs['neighbors'])
-#     print("goal shape:", obs['goal'].shape)
-#     print("goal:", obs['goal'])
+
 
 
 def render_global_state(state, goal_positions, step_idx=None, wake_length=5):
@@ -462,15 +540,21 @@ def render_global_state(state, goal_positions, step_idx=None, wake_length=5):
 ##Debugging purposes
 
 # ship_idx = 0
-# timestep = 1
+# timestep = 5
 
-# print("=== LOG TRAJECTORY (Original) ===")
-# print(f"X: {sim_state.log_trajectory.x[ship_idx, timestep]}")
-# print(f"Y: {sim_state.log_trajectory.y[ship_idx, timestep]}")
-# print(f"Speed: {sim_state.log_trajectory.speed[ship_idx, timestep]}")
-# print(f"Yaw: {sim_state.log_trajectory.yaw[ship_idx, timestep]}")
+# # print("=== LOG TRAJECTORY (Original) ===")
+# # print(f"X: {sim_state.log_trajectory.x[ship_idx, timestep-1]}")
+# # print(f"Y: {sim_state.log_trajectory.y[ship_idx, timestep-1]}")
+# # print(f"Speed: {sim_state.log_trajectory.speed[ship_idx, timestep-1]}")
+# # print(f"Yaw: {sim_state.log_trajectory.yaw[ship_idx, timestep-1]}")
 
-# print("\n=== SIM TRAJECTORY (Simulated) ===")
+# print("\n=== SIM TRAJECTORY (Simulated Previous) ===")
+# print(f"X: {states[timestep].sim_trajectory.x[ship_idx, timestep-1]}")
+# print(f"Y: {states[timestep].sim_trajectory.y[ship_idx, timestep-1]}")
+# print(f"Speed: {states[timestep].sim_trajectory.speed[ship_idx, timestep-1]}")
+# print(f"Yaw: {states[timestep].sim_trajectory.yaw[ship_idx, timestep-1]}")
+
+# print("\n=== SIM TRAJECTORY (Simulated Current) ===")
 # print(f"X: {states[timestep].sim_trajectory.x[ship_idx, timestep]}")
 # print(f"Y: {states[timestep].sim_trajectory.y[ship_idx, timestep]}")
 # print(f"Speed: {states[timestep].sim_trajectory.speed[ship_idx, timestep]}")
