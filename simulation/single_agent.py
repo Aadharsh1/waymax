@@ -19,20 +19,17 @@ import dataclasses
 import jax
 import mediapy
 import matplotlib.pyplot as plt
-from bc_actor import BCActor
+from .bc_actor import BCActor
 import torch
 from waymax.agents.actor_core import WaymaxActorOutput
 from maritime_rl.utils import haversine_distance
 from waymax import datatypes
 
 def save_combined_results_to_csv(results, filename_prefix="simulation_combined"):
-    """
-    Save both individual and aggregate results to a single CSV file
-    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{filename_prefix}_{timestamp}.csv"
     
-    with open(filename, mode='w', newline='') as file:
+    with open(f'metrics/{filename}', mode='w', newline='') as file:
         writer = csv.writer(file)
         
         # Write aggregate summary first
@@ -134,14 +131,14 @@ def simulate_single_ship(ship_index, actor_type='bc'):
     print(f"\n=== SIMULATING SHIP {ship_index} ({actor_type.upper()}) ===")
     
     # Load data
-    with open('./trajs_times/trajs_times_overlap.pkl', 'rb') as f:  
+    with open('trajs_times/trajs_times_overlap.pkl', 'rb') as f:  
         data = pickle.load(f)
 
     trajs = data['trajs']
     times = data['times']
     overlap_idx = data['overlap_idx']  
 
-    with open('observations_original.pkl', 'rb') as f:
+    with open('observations/observations_original.pkl', 'rb') as f:
         observations = pickle.load(f)
 
     region_of_interest = {"LON": (103.82, 103.88), "LAT": (1.15, 1.22)}
@@ -220,19 +217,19 @@ def simulate_single_ship(ship_index, actor_type='bc'):
         object_metadata=meta, timestep=jnp.array(0),
     )
 
-    # ✅ FIXED: Create environment with correct parameters
+
     dynamics_model = CustomShipDynamics()
     env = CustomEnvironment(
         dynamics_model=dynamics_model,
         config=dataclasses.replace(
             EnvironmentConfig(),
-            max_num_objects=1,  # ✅ Single ship
+            max_num_objects=1, 
             controlled_object=ObjectType.VALID
         ),
         trajs=trajs,
         times=times,
         overlap_idx=overlap_idx,  
-        original_ship_indices=[ship_index]  # ✅ Single ship index in list
+        original_ship_indices=[ship_index]  
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -246,7 +243,7 @@ def simulate_single_ship(ship_index, actor_type='bc'):
             environment=env, normalize=False, max_x=max_x, max_y=max_y
         )
         jit_select_action = actor.select_action
-    else:  # expert
+    else:  
         actor = agents.create_expert_actor(dynamics_model=CustomShipDynamics())
         jit_select_action = jax.jit(actor.select_action)
 
@@ -437,7 +434,7 @@ def run_single_agent_simulations(ship_indices, actor_type='bc'):
 # Example usage
 if __name__ == "__main__":
     # Specify which ships to simulate
-    SHIP_INDICES = list(range(10))
+    SHIP_INDICES = list(range(5))
     
     # Run BC actor simulations
     bc_results = run_single_agent_simulations(SHIP_INDICES, actor_type='bc')

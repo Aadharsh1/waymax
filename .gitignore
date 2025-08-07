@@ -12,6 +12,6 @@ venv/
 # Ignore all observation and data files
 *.pkl
 *.csv
-
+*.mp4
 # Ignore directories containing datasets and model weights
 trajs_times/

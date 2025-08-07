@@ -9,6 +9,7 @@ from imitation.data import types, rollout
 from imitation.util import logger as imit_logger
 from utils import haversine_distance
 import argparse
+from collections import defaultdict
 import wandb
 
 region_of_interest = {"LON": (103.82, 103.88), "LAT": (1.15, 1.22)}
@@ -67,33 +68,22 @@ action_space = spaces.Box(
 
 
 #Load the observations 
-with open('observations_original.pkl', 'rb') as f:
-	observations = pickle.load(f)
+with open('expert_obs.pkl', 'rb') as f:
+    expert_data = pickle.load(f)
 
+episodes = defaultdict(list)
+for step in expert_data:
+    ep_id = step.get('episode_id')
+    if ep_id is None:
+        raise ValueError("Expert data missing 'episode_id' key; add it during data collection.")
+    episodes[ep_id].append(step)
 
 im_trajs = []
-for ship_idx, ship_obs in enumerate(observations):
-    if len(ship_obs) < 2:
-        continue
-        
-    T = len(ship_obs) - 1
-    obs_list, act_list, rew_list = [], [], []
 
-    for t in range(T):
-        obs = ship_obs[t]
-        next_obs = ship_obs[t+1]
-        
-        dx = next_obs['ego'][-1, 0] - obs['ego'][-1, 0]
-        dy = next_obs['ego'][-1, 1] - obs['ego'][-1, 1]
-        dheading = (next_obs['ego'][-1, 3] - obs['ego'][-1, 3] + np.pi) % (2 * np.pi) - np.pi
-        action = np.array([dx, dy, dheading], dtype=np.float32)
-        
-        obs_list.append(obs)
-        act_list.append(action)
-        rew_list.append(0.0)
-    
-
-    obs_list.append(ship_obs[-1])
+def create_trajectory_from_steps(steps):
+    obs_list = [s['obs'] for s in steps]
+    act_list = [s['action'] for s in steps]
+    obs_list.append(steps[-1]['obs'])  # append last obs
 
     ego_stack = np.stack([o['ego'] for o in obs_list]).astype(np.float32)
     neighbors_stack = np.stack([o['neighbors'] for o in obs_list]).astype(np.float32)
@@ -105,23 +95,29 @@ for ship_idx, ship_obs in enumerate(observations):
         'goal': goal_stack
     }
 
-    acts = np.array(act_list)
-    rews = np.array(rew_list)
+    acts = np.array(act_list).astype(np.float32)
+    rews = np.zeros_like(acts[:, 0])  # zeros for reward
 
     dict_obs = types.DictObs(obs_dict)
 
-    im_trajs.append(types.TrajectoryWithRew(
-        obs=dict_obs,  
+    return types.TrajectoryWithRew(
+        obs=dict_obs,
         acts=acts,
         infos=None,
         terminal=True,
         rews=rews
-    ))
+    )
 
-total_obs = sum(len(traj.obs) for traj in im_trajs) 
+for ep_id, steps in episodes.items():
+    traj = create_trajectory_from_steps(steps)
+    im_trajs.append(traj)
+
+total_obs = sum(len(traj.obs) for traj in im_trajs)
 total_actions = sum(len(traj.acts) for traj in im_trajs)
+
 print(f"Total observations across all trajectories: {total_obs}")
 print(f"Total actions across all trajectories: {total_actions}")
+print(f"Number of trajectories (episodes): {len(im_trajs)}")
 
 # Flatten trajectories
 transitions = rollout.flatten_trajectories(im_trajs)
@@ -132,7 +128,7 @@ batch = 256
 l2_w = 0.001
 #l2_orig = 0.001
 #batch orig = 256 
-run_name = 'bc_original_epoch300'
+run_name = 'bc_expert_epoch300'
 
 wandb.init(
     project="ShipNavism",

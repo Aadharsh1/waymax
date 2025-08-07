@@ -267,10 +267,10 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
   def observe_agent(self,
               states_history: list,
               agent_idx: int,
-              trajs: list,  # Original trajectory data
-              times: list,  # Original time data
-              overlap_idx: list,  # Add this parameter
-              ego_start_time: float,  # Starting time for this ego agent
+              trajs: list,  
+              times: list, 
+              overlap_idx: list, 
+              ego_start_time: float,  
               history_len: int = 5,
               n_neighbors: int = 10):
 
@@ -278,10 +278,10 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
     current_state = states_history[-1]
     current_timestep = int(current_state.timestep)
     
-    # Calculate current time based on simulation timestep
-    current_time = ego_start_time + (current_timestep * 10.0)  # Assuming 10s intervals
+
+    current_time = ego_start_time + (current_timestep * 10.0) 
     
-    # --- 1. Build Ego History from Simulation (Closed-Loop) ---
+    
     ego_history = np.zeros((history_len + 1, 4), dtype=np.float32)
     for i in range(history_len + 1):
         history_offset = history_len - i
@@ -294,7 +294,7 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
                 ego_history[i, 2] = past_state.sim_trajectory.speed[agent_idx, past_timestep]
                 ego_history[i, 3] = past_state.sim_trajectory.yaw[agent_idx, past_timestep]
 
-    # --- 2. Find Neighbors using Original Method with overlap_idx ---
+  
     ego_pos_current = ego_history[-1, :2]
     neighbor_candidates = []
     
@@ -319,19 +319,17 @@ class BaseEnvironment(abstract_environment.AbstractEnvironment):
     while len(nearest_neighbors) < n_neighbors:
         nearest_neighbors.append(-1)
     
-    # --- 3. Build Neighbor Histories EXACTLY like training ---
+    
     all_neighbors_history = []
     
     for n_idx in nearest_neighbors:
         if n_idx == -1:
             all_neighbors_history.append(np.zeros((history_len + 1, 4), dtype=np.float32))
         else:
-            # MATCH TRAINING: Find best time match for current_time, then use get_padded_history
             neighbor_times = times[n_idx]
             time_diffs = np.abs(neighbor_times - current_time)
             best_neighbor_t = np.argmin(time_diffs)
             
-            # Use the SAME get_padded_history function as training
             neighbor_history = get_padded_history(trajs[n_idx], best_neighbor_t, history_len)
             all_neighbors_history.append(neighbor_history)
     

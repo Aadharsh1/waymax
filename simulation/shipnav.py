@@ -1,31 +1,33 @@
+import os
 import pickle
-TARGET_FPS = 10
-import pandas as pd
-import os
-import os
+import dataclasses
+
 import pandas as pd
 import numpy as np
+
+import jax
 import jax.numpy as jnp
+
+import torch
+import mediapy
+import matplotlib.pyplot as plt
+
 from waymax.datatypes import (
     SimulatorState,
     ShipTrajectory as Trajectory,
     ObjectMetadata,
     Action,
 )
-from waymax import dynamics, agents
-from waymax.env import MultiAgentEnvironment,WaymaxGymEnv
+from waymax import dynamics, agents, datatypes
+from waymax.env import MultiAgentEnvironment, WaymaxGymEnv
 from waymax.config import EnvironmentConfig, ObjectType
-import dataclasses
-import jax
-import mediapy
-import matplotlib.pyplot as plt
-from bc_actor import BCActor
-import torch
 from waymax.agents.actor_core import WaymaxActorOutput
-import numpy as np
-import jax.numpy as jnp
-from maritime_rl.utils import haversine_distance
-from waymax import datatypes
+
+from maritime_rl.utils import haversine_distance   
+
+from .bc_actor import BCActor   
+
+TARGET_FPS = 10
 
 class CustomShipDynamics(dynamics.StateDynamics):
     def forward(self, action: datatypes.Action,
@@ -59,11 +61,11 @@ class CustomShipDynamics(dynamics.StateDynamics):
         )
 
 class CustomEnvironment(MultiAgentEnvironment):
-    def __init__(self, dynamics_model, config, trajs, times, overlap_idx, original_ship_indices):  # Add overlap_idx
+    def __init__(self, dynamics_model, config, trajs, times, overlap_idx, original_ship_indices):  
         super().__init__(dynamics_model, config)
         self.trajs = trajs
         self.times = times
-        self.overlap_idx = overlap_idx  # Add this
+        self.overlap_idx = overlap_idx  
         self.original_ship_indices = original_ship_indices 
         self.ego_start_times = [times[idx][0] for idx in original_ship_indices]
     
@@ -75,19 +77,19 @@ class CustomEnvironment(MultiAgentEnvironment):
             agent_idx=original_agent_idx,  
             trajs=self.trajs,
             times=self.times,
-            overlap_idx=self.overlap_idx,  # Add this
+            overlap_idx=self.overlap_idx,  
             ego_start_time=self.ego_start_times[agent_idx],
             **kwargs
         )
 
-with open('./trajs_times/trajs_times_overlap.pkl', 'rb') as f:  
+with open('trajs_times/trajs_times_overlap.pkl', 'rb') as f:
     data = pickle.load(f)
 
 trajs = data['trajs']
 times = data['times']
 overlap_idx = data['overlap_idx']  
 
-with open('observations_original.pkl', 'rb') as f:
+with open('observations/observations_original.pkl', 'rb') as f:
     observations = pickle.load(f)
 
 region_of_interest = {"LON": (103.82, 103.88), "LAT": (1.15, 1.22)}
@@ -95,7 +97,10 @@ origin_lon, origin_lat = region_of_interest['LON'][0], region_of_interest['LAT']
 max_x = haversine_distance(origin_lon, origin_lat, region_of_interest['LON'][1], origin_lat)
 max_y = haversine_distance(origin_lon, origin_lat, origin_lon, region_of_interest['LAT'][1])
 
-SHIP_INDICES = [55]
+SHIP_INDICES = [0, 55]
+expert_agent_ids = jnp.array([0])    
+bc_agent_ids = jnp.array([1])
+
 observations = [observations[i] for i in SHIP_INDICES]
 num_ships = len(observations)
 max_length = max(len(ship_obs) for ship_obs in observations)
@@ -243,9 +248,6 @@ bc_actor = BCActor(
 )
 
 
-expert_agent_ids = jnp.array([])    
-bc_agent_ids = jnp.array([0])
-
 actor_list = [
     (actor_expert, lambda state: jnp.isin(state.object_metadata.ids, expert_agent_ids)),
     (bc_actor, lambda state: jnp.isin(state.object_metadata.ids, bc_agent_ids))
@@ -278,8 +280,8 @@ states = [sim_state]
 done_mask = jnp.zeros(num_agents, dtype=bool)  
 done_mask_history = []
 
-
-for _ in range(max_length - 1):
+max_timesteps = 1000
+for _ in range(max_timesteps):
     current_state = states[-1]
     outputs = [None] * num_agents
 
@@ -304,12 +306,11 @@ for _ in range(max_length - 1):
     if jnp.all(done_mask):
         break
 
-# After simulation, convert done_mask_history to array
+
 if len(done_mask_history) == 0:
     done_mask_history = jnp.zeros((1, num_agents), dtype=bool)
 else:
     done_mask_history = jnp.stack(done_mask_history, axis=0)
-# Find the first done step for each agent
 first_done_step = []
 for agent_idx in range(num_agents):
     done_steps = jnp.where(done_mask_history[:, agent_idx])[0]
@@ -529,12 +530,14 @@ def render_global_state(state, goal_positions, step_idx=None, wake_length=5):
     plt.close(fig)
     return img
 
-# imgs = [
-#     render_global_state(s, goal_positions=goal_positions, step_idx=i)
-#     for i, s in enumerate(states)
-# ]
+imgs = [
+    render_global_state(s, goal_positions=goal_positions, step_idx=i)
+    for i, s in enumerate(states)
+]
 
-# mediapy.write_video("ship_simulation.mp4", imgs, fps=TARGET_FPS)
+filename = 'example_2'
+
+mediapy.write_video(f"visuals/{filename}.mp4", imgs, fps=TARGET_FPS)
 
 
 ##Debugging purposes

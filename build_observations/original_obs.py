@@ -85,7 +85,7 @@ def build_observations_original(trajs, times, overlap_idx, N=10, history_length=
     
     return observations
 
-with open('./trajs_times/trajs_times_overlap.pkl', 'rb') as f:
+with open('trajs_times/trajs_times_overlap.pkl', 'rb') as f:
     data = pickle.load(f)
 
 trajs = data['trajs']
@@ -94,14 +94,15 @@ overlap_idx = data['overlap_idx']
 
 observations = build_observations_original(
     trajs, times, overlap_idx, 
-    N=10,  
+    N=1,  
     history_length=5 
 )
 
-with open('observations_original.pkl', 'wb') as f:
+filename = 'original_observations'
+
+with open(f'observations/{filename}', 'wb') as f:
     pickle.dump(observations, f)
 
-print(f"Successfully built observations using original method!")
 print(f"Total ships: {len(observations)}")
 
 
